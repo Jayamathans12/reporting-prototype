@@ -1,0 +1,403 @@
+import rawReports from "./inspecRaw.json";
+
+/* ------------------------------- raw types ------------------------------- */
+
+export interface RawResult {
+  status: string;
+  codeDesc: string;
+  runTime: number;
+  message?: string;
+  skipMessage?: string;
+}
+
+export interface RawControl {
+  id: string;
+  title: string;
+  desc: string;
+  impact: number;
+  code: string;
+  sourceRef: string;
+  sourceLine: number;
+  waived: boolean;
+  results: RawResult[];
+}
+
+export interface RawProfile {
+  name: string;
+  title: string;
+  version: string;
+  maintainer: string;
+  maintainerEmail: string;
+  summary: string;
+  sha256: string;
+  status: string;
+  controls: RawControl[];
+}
+
+export interface RawReport {
+  id: string;
+  nodeId: string;
+  nodeName: string;
+  endTime: number;
+  status: string;
+  environment: string;
+  inspecVersion: string;
+  platform: string;
+  platformName: string;
+  duration: number;
+  ipAddress: string;
+  fqdn: string;
+  chefServer: string;
+  chefOrganization: string;
+  statusMessage: string;
+  profiles: RawProfile[];
+}
+
+export const reports = rawReports as RawReport[];
+
+/* -------------------------------- app types ------------------------------ */
+
+export type ControlStatus = "Passed" | "Failed" | "Skipped" | "Waived";
+
+export interface TestResult {
+  description: string;
+  status: "Passed" | "Failed" | "Skipped";
+  message?: string;
+  duration: string;
+}
+
+export interface ControlDetail {
+  id: string;
+  key: string;
+  title: string;
+  description: string;
+  profileId: string;
+  profileName: string;
+  profileVersion: string;
+  impact: number;
+  severity: "Critical" | "Major" | "Minor";
+  status: ControlStatus;
+  lastScan: string;
+  source: string;
+  results: TestResult[];
+  nodeStatus: { failed: number; passed: number; skipped: number; waived: number };
+}
+
+export interface ProfileDetail {
+  id: string;
+  name: string;
+  rootProfile: string;
+  version: string;
+  maintainer: string;
+  license: string;
+  platform: string;
+  description: string;
+  status: ControlStatus;
+  controlIds: string[];
+}
+
+export interface ComplianceScan {
+  id: string;
+  lastScan: string;
+  status: "Passed" | "Failed";
+  node: string;
+  platform: string;
+  environment: string;
+  controlFailures: string;
+}
+
+export interface ScanHistoryItem {
+  scanId: string;
+  timestamp: string;
+  relative: string;
+  status: "Passed" | "Failed";
+  hoursAgo: number;
+}
+
+export interface ScanDetail {
+  scan: ComplianceScan;
+  timestamp: string;
+  inspecVersion: string;
+  ipAddress: string;
+  nodeId: string;
+  fqdn: string;
+  chefServer: string;
+  chefOrganization: string;
+  duration: string;
+  profiles: ProfileDetail[];
+  controls: ControlDetail[];
+  counts: { total: number; failed: number; passed: number; skipped: number; waived: number };
+}
+
+/* -------------------------------- helpers -------------------------------- */
+
+const NOW = Math.max(...reports.map((r) => r.endTime)) + 12 * 60;
+
+function relativeTime(seconds: number): string {
+  const diff = Math.max(1, Math.round((NOW - seconds) / 60));
+  if (diff < 60) return `${diff} minute${diff === 1 ? "" : "s"} ago`;
+  const hours = Math.round(diff / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  const days = Math.round(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
+}
+
+function utcStamp(seconds: number): string {
+  return new Date(seconds * 1000).toUTCString().replace(" GMT", " UTC");
+}
+
+export function profileSlug(profile: RawProfile): string {
+  return `${profile.name}-${profile.version}`.replace(/[^a-zA-Z0-9.-]+/g, "-").toLowerCase();
+}
+
+function severityFor(impact: number): ControlDetail["severity"] {
+  if (impact >= 0.7) return "Critical";
+  if (impact >= 0.4) return "Major";
+  return "Minor";
+}
+
+function statusOf(control: RawControl): ControlStatus {
+  if (control.waived) return "Waived";
+  if (control.results.some((r) => r.status === "failed")) return "Failed";
+  if (control.results.length > 0 && control.results.every((r) => r.status === "skipped")) return "Skipped";
+  if (control.results.length === 0) return "Skipped";
+  return "Passed";
+}
+
+function toControl(control: RawControl, profile: RawProfile, lastScan: string): ControlDetail {
+  const status = statusOf(control);
+  const results: TestResult[] = control.results.map((r) => ({
+    description: r.codeDesc || r.skipMessage || "—",
+    status: r.status === "failed" ? "Failed" : r.status === "skipped" ? "Skipped" : "Passed",
+    duration: `${r.runTime.toFixed(3)}s`,
+    ...(r.message || r.skipMessage ? { message: r.message ?? r.skipMessage } : {}),
+  }));
+  return {
+    id: `${profileSlug(profile)}--${control.id}`,
+    key: control.id,
+    title: control.title,
+    description: control.desc || control.title,
+    profileId: profileSlug(profile),
+    profileName: profile.title || profile.name,
+    profileVersion: profile.version,
+    impact: control.impact,
+    severity: severityFor(control.impact),
+    status,
+    lastScan,
+    source: control.code || `control '${control.id}' do\n  impact ${control.impact}\nend`,
+    results,
+    nodeStatus: {
+      failed: status === "Failed" ? 1 : 0,
+      passed: status === "Passed" ? 1 : 0,
+      skipped: status === "Skipped" ? 1 : 0,
+      waived: status === "Waived" ? 1 : 0,
+    },
+  };
+}
+
+function toProfileDetail(profile: RawProfile): ProfileDetail {
+  const controls = profile.controls.map((c) => toControl(c, profile, ""));
+  const failed = controls.filter((c) => c.status === "Failed").length;
+  return {
+    id: profileSlug(profile),
+    name: profile.title || profile.name,
+    rootProfile: profile.name,
+    version: profile.version,
+    maintainer: profile.maintainer || "Unknown",
+    license: profile.maintainerEmail || "—",
+    platform: "os",
+    description: profile.summary || profile.title,
+    status: failed > 0 ? "Failed" : "Passed",
+    controlIds: profile.controls.map((c) => c.id),
+  };
+}
+
+function countsOf(controls: ControlDetail[]) {
+  return {
+    total: controls.length,
+    failed: controls.filter((c) => c.status === "Failed").length,
+    passed: controls.filter((c) => c.status === "Passed").length,
+    skipped: controls.filter((c) => c.status === "Skipped").length,
+    waived: controls.filter((c) => c.status === "Waived").length,
+  };
+}
+
+/* ------------------------------ scan details ----------------------------- */
+
+function buildScanDetail(report: RawReport): ScanDetail {
+  const lastScan = relativeTime(report.endTime);
+  const controls = report.profiles.flatMap((p) => p.controls.map((c) => toControl(c, p, lastScan)));
+  const counts = countsOf(controls);
+  return {
+    scan: {
+      id: report.id,
+      lastScan,
+      status: report.status === "passed" ? "Passed" : "Failed",
+      node: report.nodeName,
+      platform: report.platform,
+      environment: report.environment,
+      controlFailures: counts.failed > 0 ? `${counts.failed} Failed` : "Passed",
+    },
+    timestamp: utcStamp(report.endTime),
+    inspecVersion: report.inspecVersion,
+    ipAddress: report.ipAddress || "—",
+    nodeId: report.nodeId,
+    fqdn: report.fqdn || "—",
+    chefServer: report.chefServer || "—",
+    chefOrganization: report.chefOrganization || "—",
+    duration: `${report.duration.toFixed(3)}s`,
+    profiles: report.profiles.map(toProfileDetail),
+    controls,
+    counts,
+  };
+}
+
+const scanDetails = new Map<string, ScanDetail>(reports.map((r) => [r.id, buildScanDetail(r)]));
+
+export function getScanDetail(scanId: string): ScanDetail | undefined {
+  return scanDetails.get(scanId);
+}
+
+/** Latest scan per node, most recent first. */
+export const complianceScans: ComplianceScan[] = (() => {
+  const latest = new Map<string, RawReport>();
+  for (const report of reports) {
+    const current = latest.get(report.nodeName);
+    if (!current || report.endTime > current.endTime) latest.set(report.nodeName, report);
+  }
+  return Array.from(latest.values())
+    .sort((a, b) => b.endTime - a.endTime)
+    .map((r) => scanDetails.get(r.id)!.scan);
+})();
+
+export function getComplianceScan(scanId: string): ComplianceScan | undefined {
+  return scanDetails.get(scanId)?.scan;
+}
+
+export function getScanHistory(scanId: string): ScanHistoryItem[] {
+  const report = reports.find((r) => r.id === scanId);
+  if (!report) return [];
+  return reports
+    .filter((r) => r.nodeName === report.nodeName)
+    .sort((a, b) => b.endTime - a.endTime)
+    .map((r) => ({
+      scanId: r.id,
+      timestamp: utcStamp(r.endTime),
+      relative: relativeTime(r.endTime),
+      status: r.status === "passed" ? ("Passed" as const) : ("Failed" as const),
+      hoursAgo: Math.max(0, (NOW - r.endTime) / 3600),
+    }));
+}
+
+/* ------------------------- list-level aggregates ------------------------- */
+
+export interface ProfileRow extends ProfileDetail {
+  controlCount: number;
+  failedControls: number;
+  nodeCount: number;
+}
+
+const profileIndex = (() => {
+  const map = new Map<string, { profile: RawProfile; nodes: Set<string> }>();
+  for (const report of reports) {
+    for (const profile of report.profiles) {
+      const key = profileSlug(profile);
+      const entry = map.get(key) ?? { profile, nodes: new Set<string>() };
+      entry.nodes.add(report.nodeName);
+      map.set(key, entry);
+    }
+  }
+  return map;
+})();
+
+export function getProfileRows(): ProfileRow[] {
+  return Array.from(profileIndex.values()).map(({ profile, nodes }) => {
+    const detail = toProfileDetail(profile);
+    const controls = getProfileControls(detail.id);
+    return {
+      ...detail,
+      controlCount: controls.length,
+      failedControls: controls.filter((c) => c.status === "Failed").length,
+      nodeCount: nodes.size,
+    };
+  });
+}
+
+export function getProfileControls(profileId: string): ControlDetail[] {
+  const entry = profileIndex.get(profileId);
+  if (!entry) return [];
+  const report = reports.find((r) => r.profiles.some((p) => profileSlug(p) === profileId));
+  const lastScan = report ? relativeTime(report.endTime) : "";
+  return entry.profile.controls.map((c) => toControl(c, entry.profile, lastScan));
+}
+
+export function getProfile(profileId: string): ProfileDetail | undefined {
+  const entry = profileIndex.get(profileId);
+  return entry ? toProfileDetail(entry.profile) : undefined;
+}
+
+export const PROFILES: ProfileDetail[] = Array.from(profileIndex.values()).map(({ profile }) =>
+  toProfileDetail(profile),
+);
+
+export interface ControlRow extends ControlDetail {
+  nodes: string[];
+}
+
+export function getControlRows(): ControlRow[] {
+  const map = new Map<string, ControlRow>();
+  for (const report of reports) {
+    const lastScan = relativeTime(report.endTime);
+    for (const profile of report.profiles) {
+      for (const raw of profile.controls) {
+        const control = toControl(raw, profile, lastScan);
+        const existing = map.get(control.id);
+        if (existing) {
+          if (!existing.nodes.includes(report.nodeName)) existing.nodes.push(report.nodeName);
+        } else {
+          map.set(control.id, { ...control, nodes: [report.nodeName] });
+        }
+      }
+    }
+  }
+  return Array.from(map.values());
+}
+
+export function getNodeControls(scanId: string): ControlDetail[] {
+  return getScanDetail(scanId)?.controls ?? [];
+}
+
+export interface ProfileNodeRef {
+  scanId: string;
+  nodeName: string;
+  relative: string;
+  status: "Passed" | "Failed";
+}
+
+/** Nodes (latest scan each) that ran a given profile. */
+export function getProfileNodes(profileId: string): ProfileNodeRef[] {
+  const latest = new Map<string, RawReport>();
+  for (const report of reports) {
+    if (!report.profiles.some((p) => profileSlug(p) === profileId)) continue;
+    const current = latest.get(report.nodeName);
+    if (!current || report.endTime > current.endTime) latest.set(report.nodeName, report);
+  }
+  return Array.from(latest.values())
+    .sort((a, b) => b.endTime - a.endTime)
+    .map((r) => ({
+      scanId: r.id,
+      nodeName: r.nodeName,
+      relative: relativeTime(r.endTime),
+      status: r.status === "passed" ? ("Passed" as const) : ("Failed" as const),
+    }));
+}
+
+/** Controls of a profile as executed on a specific scan/node. */
+export function getProfileControlsForScan(profileId: string, scanId: string): ControlDetail[] {
+  const report = reports.find((r) => r.id === scanId);
+  if (!report) return getProfileControls(profileId);
+  const profile = report.profiles.find((p) => profileSlug(p) === profileId);
+  if (!profile) return [];
+  const lastScan = relativeTime(report.endTime);
+  return profile.controls.map((c) => toControl(c, profile, lastScan));
+}
